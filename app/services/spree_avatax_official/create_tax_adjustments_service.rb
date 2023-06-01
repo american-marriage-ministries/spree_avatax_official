@@ -56,9 +56,8 @@ module SpreeAvataxOfficial
       # Spree allows to setup shipping methods without tax category and
       # in that case it doesn't make sense to collect any tax,
       # especially because of validation that requires presence of tax category
-      if !item.nil?
-        return if item.tax_category.nil?
-      end
+      return if item.nil?
+      return if item.tax_category.nil?
 
       tax_rate = find_or_create_tax_rate(item, avatax_item)
 
