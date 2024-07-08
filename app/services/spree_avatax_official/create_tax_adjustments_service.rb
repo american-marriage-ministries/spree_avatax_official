@@ -3,23 +3,26 @@ module SpreeAvataxOfficial
     include SpreeAvataxOfficial::TaxAdjustmentLabelHelper
 
     def call(order:) # rubocop:disable Metrics/AbcSize
-      return failure(::Spree.t('spree_avatax_official.create_tax_adjustments.order_canceled')) if order.canceled?
+      order.save!
+      order.with_lock do
+        return failure(::Spree.t('spree_avatax_official.create_tax_adjustments.order_canceled')) if order.canceled?
 
-      order.all_adjustments.tax.destroy_all
+        order.all_adjustments.tax.destroy_all
 
-      return failure(::Spree.t('spree_avatax_official.create_tax_adjustments.tax_calculation_unnecessary')) unless order.avatax_tax_calculation_required?
+        return failure(::Spree.t('spree_avatax_official.create_tax_adjustments.tax_calculation_unnecessary')) unless order.avatax_tax_calculation_required?
 
-      transaction_cache_key = SpreeAvataxOfficial::GenerateTransactionCacheKeyService.call(order: order).value
+        transaction_cache_key = SpreeAvataxOfficial::GenerateTransactionCacheKeyService.call(order: order).value
 
-      avatax_response       = Rails.cache.fetch(transaction_cache_key, expires_in: 5.minutes) do
-        send_transaction_to_avatax(order)
+        avatax_response       = Rails.cache.fetch(transaction_cache_key, expires_in: 5.minutes) do
+          send_transaction_to_avatax(order)
+        end
+
+        return failure(build_error_message_from_response(avatax_response.value)) if avatax_failed_response?(avatax_response)
+
+        process_avatax_items(order, avatax_response.value['lines'], avatax_response)
+
+        success(true)
       end
-
-      return failure(build_error_message_from_response(avatax_response.value)) if avatax_failed_response?(avatax_response)
-
-      process_avatax_items(order, avatax_response.value['lines'])
-
-      success(true)
     end
 
     private
@@ -40,11 +43,11 @@ module SpreeAvataxOfficial
       avatax_response.failure? || avatax_response.value['totalTax'].zero?
     end
 
-    def process_avatax_items(order, avatax_items)
-      avatax_items.each { |avatax_item| process_avatax_item(order, avatax_item) }
+    def process_avatax_items(order, avatax_items, avatax_response = nil)
+      avatax_items.each { |avatax_item| process_avatax_item(order, avatax_item, avatax_response) }
     end
 
-    def process_avatax_item(order, avatax_item)
+    def process_avatax_item(order, avatax_item, avatax_response = nil)
       tax_amount = avatax_item['taxCalculated']
 
       return if tax_amount.zero?
@@ -56,13 +59,14 @@ module SpreeAvataxOfficial
       # Spree allows to setup shipping methods without tax category and
       # in that case it doesn't make sense to collect any tax,
       # especially because of validation that requires presence of tax category
+      return if item.nil?
       return if item.tax_category.nil?
 
       tax_rate = find_or_create_tax_rate(item, avatax_item)
 
       store_pre_tax_amount(item, tax_rate, tax_amount)
 
-      create_tax_adjustment(item, tax_rate, tax_amount)
+      create_tax_adjustment(item, tax_rate, tax_amount, avatax_response)
     end
 
     def find_item(order, uuid, suffix)
@@ -91,7 +95,7 @@ module SpreeAvataxOfficial
       ENV.fetch('AVATAX_TAX_RATE_NAME', 'AvaTax Official Tax Rate')
     end
 
-    def create_tax_adjustment(item, source, amount)
+    def create_tax_adjustment(item, source, amount, avatax_response = nil)
       item.adjustments.create!(
         source:   source,
         amount:   amount,
@@ -99,6 +103,8 @@ module SpreeAvataxOfficial
         label:    tax_adjustment_label(item, source.amount),
         order:    item.order
       )
+
+      log_unusual_item(item, avatax_response) if item.adjustments.tax.count > 1
     end
 
     def store_pre_tax_amount(item, tax_rate, tax_amount)
@@ -128,6 +134,22 @@ module SpreeAvataxOfficial
 
     def error_present?(avatax_response)
       avatax_response && avatax_response['error'].present?
+    end
+
+    def log_unusual_item(item, avatax_response)
+      Airbrake.notify('[AVATAX] Unusual item with more than one tax adjustment:', {
+        order: item.order.inspect,
+        adjustments: item.adjustments.map(&:inspect).join(', '),
+        line_item: item.inspect,
+        avatax_response: log_response(avatax_response)
+      })
+    end
+
+    def log_response(message)
+      return "" if message.nil?
+      return message.to_json unless message.respond_to?(:status)
+
+      "#{message.status} #{message.body.to_json}"
     end
   end
 end
